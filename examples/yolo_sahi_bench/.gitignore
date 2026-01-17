@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual env
+.venv/
+
+# OS
+.DS_Store
+
+# Large artifacts / local data
+*.pt
+*.onnx
+*.engine
+*.tflite
+
+# Datasets (often large)
+datasets/
+
+# Results: keep reports/tables, ignore heavy run artifacts and UI exports
+results/runs/
+results/ui_outputs/
+results/*.mp4
+results/*.mov
+results/*.avi
+results/*.mkv
+results/*.pdf
+
+# Streamlit
+.streamlit/
