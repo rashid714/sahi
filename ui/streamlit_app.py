@@ -79,6 +79,12 @@ def _find_weight_files() -> list[str]:
     for name in ["yolov8n.pt", "yolov8s.pt"]:
         out.add(name)
 
+    # Deployed/project-provided weights (recommended place to put custom .pt files for Streamlit Cloud).
+    models_dir = WORKSPACE_ROOT / "models"
+    if models_dir.exists():
+        for p in models_dir.rglob("*.pt"):
+            out.add(str(p.relative_to(WORKSPACE_ROOT)))
+
     runs = WORKSPACE_ROOT / "results" / "runs"
     if runs.exists():
         for p in runs.rglob("weights/*.pt"):

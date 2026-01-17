@@ -4,6 +4,10 @@
 *.pth
 *.pt
 *.onnx
+
+# Allow shipping a small set of demo/trained weights for Streamlit deployment
+!models/
+!models/**/*.pt
 weights*
 .vscode
 .idea
