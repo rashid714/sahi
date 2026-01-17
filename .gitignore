@@ -173,8 +173,6 @@ tests/data
 .python-version
 uv.lock
 
-# pip-compile
-requirements.txt
-requirements-dev.txt
+# pip-compile (keep the folder ignored if you generate compiled reqs there)
 requirements/requirements-style.txt
 requirements/*.txt
