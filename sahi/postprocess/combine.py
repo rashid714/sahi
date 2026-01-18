@@ -23,8 +23,15 @@ def batched_nms(predictions: torch.tensor, match_metric: str = "IOU", match_thre
         A list of filtered indexes, Shape: [ ,]
     """
 
-    scores = predictions[:, 4].squeeze()
-    category_ids = predictions[:, 5].squeeze()
+    # Guard against edge cases (0 or 1 prediction) where squeeze() can turn
+    # tensors into 0-D scalars and break indexing logic.
+    if predictions.numel() == 0:
+        return []
+    if predictions.ndim == 1:
+        predictions = predictions.view(1, -1)
+
+    scores = predictions[:, 4].view(-1)
+    category_ids = predictions[:, 5].to(torch.int64).view(-1)
     keep_mask = torch.zeros_like(category_ids, dtype=torch.bool)
     for category_id in torch.unique(category_ids):
         curr_indices = torch.where(category_ids == category_id)[0]

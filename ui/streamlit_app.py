@@ -79,7 +79,7 @@ def _find_weight_files() -> list[str]:
     for name in ["yolov8n.pt", "yolov8s.pt"]:
         out.add(name)
 
-    # Deployed/project-provided weights (recommended place to put custom .pt files for Streamlit Cloud).
+    # Project-provided weights (best place for custom weights when deploying).
     models_dir = WORKSPACE_ROOT / "models"
     if models_dir.exists():
         for p in models_dir.rglob("*.pt"):
@@ -108,7 +108,7 @@ def _ensure_ultralytics_data_dir():
     # Keep datasets under workspace/datasets for predictable paths.
     os.environ.setdefault("ULTRALYTICS_DATA_DIR", str((WORKSPACE_ROOT / "datasets").resolve()))
     # Keep Ultralytics cache (downloaded weights, etc.) inside the workspace when possible.
-    # Streamlit Community Cloud is read-only for some system locations.
+    # Some deployment environments are read-only for system locations.
     os.environ.setdefault("ULTRALYTICS_HOME", str((WORKSPACE_ROOT / ".ultralytics").resolve()))
 
 
@@ -135,6 +135,277 @@ def _resolve_model_path_for_sahi(model_path: str) -> str:
         return str(downloaded)
     except Exception:
         return model_path
+
+
+@st.cache_resource(show_spinner=False)
+def _load_yolo(model_path: str):
+    from ultralytics import YOLO
+
+    return YOLO(model_path)
+
+
+@st.cache_resource(show_spinner=False)
+def _load_sahi_detection_model(model_type: str, model_path: str, confidence_threshold: float, device: str):
+    from sahi import AutoDetectionModel
+
+    return AutoDetectionModel.from_pretrained(
+        model_type=model_type,
+        model_path=model_path,
+        confidence_threshold=confidence_threshold,
+        device=device,
+    )
+
+
+def _iou_xyxy(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    iw = max(0, inter_x2 - inter_x1)
+    ih = max(0, inter_y2 - inter_y1)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    denom = (area_a + area_b - inter)
+    return float(inter / denom) if denom > 0 else 0.0
+
+
+def _merge_rois(rois: list[tuple[int, int, int, int]], iou_threshold: float) -> list[tuple[int, int, int, int]]:
+    """Greedy ROI merge by IoU (union boxes when overlapping)."""
+    if not rois:
+        return []
+
+    merged: list[tuple[int, int, int, int]] = []
+    for r in rois:
+        rx1, ry1, rx2, ry2 = r
+        did_merge = False
+        for i, m in enumerate(merged):
+            if _iou_xyxy(r, m) >= iou_threshold:
+                mx1, my1, mx2, my2 = m
+                merged[i] = (min(rx1, mx1), min(ry1, my1), max(rx2, mx2), max(ry2, my2))
+                did_merge = True
+                break
+        if not did_merge:
+            merged.append(r)
+
+    # Second pass to collapse any transitive overlaps.
+    if len(merged) == len(rois):
+        return merged
+    return _merge_rois(merged, iou_threshold=iou_threshold)
+
+
+def _draw_roi_boxes(rgb: np.ndarray, rois: list[tuple[int, int, int, int]]) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    img = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(img)
+    for (x1, y1, x2, y2) in rois:
+        draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 255), width=3)
+    return np.asarray(img)
+
+
+def _propose_rois_from_pseudolabels(
+    rgb: np.ndarray,
+    proposer_model_path: str,
+    proposer_imgsz: int,
+    proposer_conf: float,
+    device: str | None,
+    roi_margin: int,
+    max_rois: int,
+    merge_iou: float,
+    target_class_ids: list[int] | None,
+) -> tuple[list[tuple[int, int, int, int]], int]:
+    """Use a fast proposer YOLO pass to create ROIs (foreground mask concept)."""
+    H, W = rgb.shape[:2]
+
+    model = _load_yolo(proposer_model_path)
+    bgr = rgb[:, :, ::-1]
+    predict_kwargs: dict[str, Any] = {
+        "imgsz": proposer_imgsz,
+        "conf": proposer_conf,
+        "device": device or "cpu",
+        "verbose": False,
+    }
+    if target_class_ids:
+        predict_kwargs["classes"] = target_class_ids
+
+    res = model.predict(bgr, **predict_kwargs)[0]
+
+    if res.boxes is None or len(res.boxes) == 0:
+        return [], 0
+
+    xyxy = res.boxes.xyxy.detach().cpu().numpy()
+    confs = res.boxes.conf.detach().cpu().numpy() if res.boxes.conf is not None else np.ones((len(xyxy),), dtype=float)
+    clss = res.boxes.cls.detach().cpu().numpy().astype(int) if res.boxes.cls is not None else np.full((len(xyxy),), -1, dtype=int)
+
+    rois_scored: list[tuple[float, tuple[int, int, int, int]]] = []
+    kept = 0
+    for (x1, y1, x2, y2), score, cls_id in zip(xyxy, confs, clss, strict=False):
+        if target_class_ids and cls_id not in target_class_ids:
+            continue
+        kept += 1
+        rx1 = max(0, int(x1) - roi_margin)
+        ry1 = max(0, int(y1) - roi_margin)
+        rx2 = min(W, int(x2) + roi_margin)
+        ry2 = min(H, int(y2) + roi_margin)
+        if (rx2 - rx1) < 2 or (ry2 - ry1) < 2:
+            continue
+        rois_scored.append((float(score), (rx1, ry1, rx2, ry2)))
+
+    rois_scored.sort(key=lambda t: t[0], reverse=True)
+    rois = [r for _, r in rois_scored[: max_rois * 3]]  # pre-cap before merge
+    rois = _merge_rois(rois, iou_threshold=merge_iou)
+    rois = rois[:max_rois]
+    return rois, kept
+
+
+def _draw_sahi_roi_gated(
+    rgb: np.ndarray,
+    proposer_model_path: str,
+    proposer_imgsz: int,
+    proposer_conf: float,
+    target_class_ids: list[int] | None,
+    refiner_model_path: str,
+    slice_size: int,
+    overlap: float,
+    conf: float,
+    device: str | None,
+    roi_margin: int,
+    max_rois: int,
+    merge_iou: float,
+    nms_iou: float,
+) -> tuple[np.ndarray, int, dict[str, Any]]:
+    """Professor-requested optimization: run SAHI only on foreground ROIs from pseudo labels."""
+
+    from sahi.predict import get_sliced_prediction
+    from sahi.postprocess.combine import NMSPostprocess
+    from sahi.utils.cv import visualize_object_predictions
+
+    H, W = rgb.shape[:2]
+
+    def _filter_preds_by_class_ids(object_predictions, class_ids: list[int] | None):
+        if not class_ids:
+            return list(object_predictions)
+        allowed = set(int(x) for x in class_ids)
+        out = []
+        for op in object_predictions:
+            cat = getattr(op, "category", None)
+            cid = getattr(cat, "id", None) if cat is not None else None
+            if cid is None:
+                continue
+            if int(cid) in allowed:
+                out.append(op)
+        return out
+
+    t0 = time.perf_counter()
+    rois, proposer_kept = _propose_rois_from_pseudolabels(
+        rgb,
+        proposer_model_path=proposer_model_path,
+        proposer_imgsz=proposer_imgsz,
+        proposer_conf=proposer_conf,
+        device=device,
+        roi_margin=roi_margin,
+        max_rois=max_rois,
+        merge_iou=merge_iou,
+        target_class_ids=target_class_ids,
+    )
+    t_propose_ms = (time.perf_counter() - t0) * 1000.0
+
+    roi_area = 0
+    for (x1, y1, x2, y2) in rois:
+        roi_area += max(0, x2 - x1) * max(0, y2 - y1)
+    fg_ratio = float(roi_area / (W * H)) if (W > 0 and H > 0) else 0.0
+
+    resolved_refiner = _resolve_model_path_for_sahi(refiner_model_path)
+    detection_model = _load_sahi_detection_model(
+        model_type="yolov8",
+        model_path=resolved_refiner,
+        confidence_threshold=float(conf),
+        device=device or "cpu",
+    )
+
+    all_preds = []
+    t1 = time.perf_counter()
+
+    if not rois:
+        # No foreground proposed => skip scanning background entirely.
+        vis_dict = visualize_object_predictions(
+            rgb,
+            [],
+            rect_th=None,
+            text_size=None,
+            text_th=None,
+            hide_labels=False,
+            hide_conf=False,
+            output_dir=None,
+        )
+        vis = vis_dict["image"]
+        meta = {
+            "roi_count": 0,
+            "rois": [],
+            "foreground_area_ratio": float(fg_ratio),
+            "proposer_kept": int(proposer_kept),
+            "proposer_ms": float(t_propose_ms),
+            "refine_ms": 0.0,
+            "post_ms": 0.0,
+        }
+        return vis, 0, meta
+
+    for (x1, y1, x2, y2) in rois:
+        crop_rgb = rgb[y1:y2, x1:x2]
+        # Ultralytics expects BGR when passing numpy arrays.
+        crop = crop_rgb[:, :, ::-1]
+        result = get_sliced_prediction(
+            crop,
+            detection_model,
+            slice_height=slice_size,
+            slice_width=slice_size,
+            overlap_height_ratio=overlap,
+            overlap_width_ratio=overlap,
+            postprocess_type="NMS",
+            perform_standard_pred=True,
+            verbose=False,
+        )
+        for op in result.object_prediction_list:
+            op.shift_amount = [int(x1), int(y1)]
+            op.full_shape = [int(H), int(W)]
+            all_preds.append(op.get_shifted_object_prediction())
+
+    t_refine_ms = (time.perf_counter() - t1) * 1000.0
+
+    t2 = time.perf_counter()
+    all_preds = _filter_preds_by_class_ids(all_preds, target_class_ids)
+    all_preds = NMSPostprocess(match_threshold=float(nms_iou), match_metric="IOU", class_agnostic=False)(all_preds)
+    vis_dict = visualize_object_predictions(
+        rgb,
+        all_preds,
+        rect_th=None,
+        text_size=None,
+        text_th=None,
+        hide_labels=False,
+        hide_conf=False,
+        output_dir=None,
+    )
+    vis = vis_dict["image"]
+    t_post_ms = (time.perf_counter() - t2) * 1000.0
+
+    meta = {
+        "roi_count": int(len(rois)),
+        "rois": [list(r) for r in rois],
+        "foreground_area_ratio": float(fg_ratio),
+        "proposer_kept": int(proposer_kept),
+        "proposer_ms": float(t_propose_ms),
+        "refine_ms": float(t_refine_ms),
+        "post_ms": float(t_post_ms),
+    }
+    return vis, int(len(all_preds)), meta
 
 
 def _slugify(text: str) -> str:
@@ -189,14 +460,22 @@ def _np_rgb_to_png_bytes(rgb: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
-def _draw_ultralytics(rgb: np.ndarray, model_path: str, imgsz: int, conf: float, device: str | None) -> tuple[np.ndarray, int]:
-    from ultralytics import YOLO
-
-    model = YOLO(model_path)
+def _draw_ultralytics(
+    rgb: np.ndarray,
+    model_path: str,
+    imgsz: int,
+    conf: float,
+    device: str | None,
+    target_class_ids: list[int] | None = None,
+) -> tuple[np.ndarray, int]:
+    model = _load_yolo(model_path)
 
     # Ultralytics uses OpenCV-style images (BGR) when passing numpy arrays.
     bgr = rgb[:, :, ::-1]
-    res = model.predict(bgr, imgsz=imgsz, conf=conf, device=device or "cpu", verbose=False)[0]
+    predict_kwargs: dict[str, Any] = {"imgsz": imgsz, "conf": conf, "device": device or "cpu", "verbose": False}
+    if target_class_ids:
+        predict_kwargs["classes"] = target_class_ids
+    res = model.predict(bgr, **predict_kwargs)[0]
     det_count = 0 if res.boxes is None else len(res.boxes)
     plotted = res.plot()  # returns BGR uint8
     bgr = plotted
@@ -212,37 +491,50 @@ def _draw_sahi(
     overlap: float,
     conf: float,
     device: str | None,
+    target_class_ids: list[int] | None = None,
 ) -> tuple[np.ndarray, int]:
-    from sahi import AutoDetectionModel
     from sahi.predict import get_sliced_prediction
     from sahi.utils.cv import visualize_object_predictions
 
-    resolved_model_path = _resolve_model_path_for_sahi(model_path)
-
-    detection_model = AutoDetectionModel.from_pretrained(
+    resolved = _resolve_model_path_for_sahi(model_path)
+    detection_model = _load_sahi_detection_model(
         model_type=model_type,
-        model_path=resolved_model_path,
-        confidence_threshold=conf,
+        model_path=resolved,
+        confidence_threshold=float(conf),
         device=device or "cpu",
     )
 
+    # Ultralytics expects BGR when passing numpy arrays.
+    bgr = rgb[:, :, ::-1]
+
     result = get_sliced_prediction(
-        rgb,
+        bgr,
         detection_model,
         slice_height=slice_size,
         slice_width=slice_size,
         overlap_height_ratio=overlap,
         overlap_width_ratio=overlap,
         postprocess_type="NMS",
-        perform_standard_pred=False,
+        perform_standard_pred=True,
         verbose=False,
     )
+
+    object_predictions = list(result.object_prediction_list)
+    if target_class_ids:
+        allowed = set(int(x) for x in target_class_ids)
+        filtered = []
+        for op in object_predictions:
+            cat = getattr(op, "category", None)
+            cid = getattr(cat, "id", None) if cat is not None else None
+            if cid is not None and int(cid) in allowed:
+                filtered.append(op)
+        object_predictions = filtered
 
     # NOTE: SAHI's visualize_object_predictions returns a dict containing the annotated image.
     # It does not modify the input array in-place.
     vis_dict = visualize_object_predictions(
         rgb,
-        result.object_prediction_list,
+        object_predictions,
         rect_th=None,
         text_size=None,
         text_th=None,
@@ -251,7 +543,7 @@ def _draw_sahi(
         output_dir=None,
     )
     vis = vis_dict["image"]
-    return vis, len(result.object_prediction_list)
+    return vis, len(object_predictions)
 
 
 def _video_preview_frames(video_path: Path, model_path: str, imgsz: int, conf: float, device: str, every_n: int, max_frames: int) -> list[np.ndarray]:
@@ -549,7 +841,14 @@ def app():
         left, right = st.columns([1, 1])
         with left:
             up = st.file_uploader("Upload image", type=["jpg", "jpeg", "png"], accept_multiple_files=False)
-            backend = st.radio("Backend", ["Ultralytics (full image)", "SAHI (sliced)"])
+            backend = st.radio(
+                "Backend",
+                [
+                    "Ultralytics (full image)",
+                    "SAHI (sliced)",
+                    "SAHI (ROI-gated via pseudo labels)",
+                ],
+            )
 
             weights = _find_weight_files()
             model_choice = st.selectbox("Model", weights, index=weights.index("yolov8s.pt") if "yolov8s.pt" in weights else 0)
@@ -561,6 +860,69 @@ def app():
 
             slice_size = st.selectbox("Slice size (SAHI)", [256, 384, 512, 640, 768], index=2)
             overlap = st.select_slider("Overlap (SAHI)", options=[0.05, 0.1, 0.2, 0.3], value=0.2)
+
+            if backend.startswith("SAHI (ROI-gated"):
+                st.divider()
+                st.write("**ROI-gated SAHI (pseudo labels)**")
+                use_same_as_refiner = st.checkbox(
+                    "Use the same weights as the refiner for proposer",
+                    value=True,
+                    help="Recommended for custom datasets. If proposer uses COCO weights but your refiner is trained on different classes, ROIs can be wrong (e.g., only one corner / wrong region).",
+                )
+
+                proposer_weights = _find_weight_files()
+                if use_same_as_refiner:
+                    proposer_model = model_path
+                    st.caption(f"Proposer weights: {proposer_model}")
+                else:
+                    proposer_model = st.selectbox(
+                        "Proposer model (fast)",
+                        proposer_weights,
+                        index=proposer_weights.index("yolov8n.pt") if "yolov8n.pt" in proposer_weights else 0,
+                        help="This model proposes foreground ROIs. If ROI-gated misses objects, try a stronger proposer (e.g., yolov8s.pt or your trained weights).",
+                    )
+
+                proposer_imgsz = st.selectbox("Proposer imgsz", [256, 320, 384, 512], index=2)
+                proposer_conf = st.select_slider("Proposer conf", options=[0.01, 0.05, 0.1, 0.15, 0.2, 0.25], value=0.1)
+                roi_margin = st.selectbox("ROI margin (px)", [0, 16, 32, 64, 96, 128], index=3)
+                max_rois = st.selectbox("Max ROIs", [1, 2, 3, 4, 6, 8], index=4)
+                merge_iou = st.select_slider("ROI merge IoU", options=[0.1, 0.2, 0.3, 0.4, 0.5], value=0.3)
+                nms_iou = st.select_slider("Final NMS IoU", options=[0.3, 0.4, 0.5, 0.6], value=0.5)
+                st.write("**Safety net (quality)**")
+                fallback_full_sahi = st.checkbox(
+                    "Fallback to full SAHI if ROI-gated output is empty",
+                    value=True,
+                    help="If ROI-gated produces no ROIs or no detections, run full-image SAHI once. This improves recall when the proposer misses foreground.",
+                )
+                fallback_condition = st.selectbox(
+                    "Fallback condition",
+                    ["either: no ROIs OR no detections", "only: no ROIs", "only: no detections"],
+                    index=0,
+                )
+                fallback_low_fg = st.checkbox(
+                    "Also fallback if foreground coverage is too small",
+                    value=True,
+                    help="Recommended. If ROIs cover only a tiny part of the image (often a corner), proposer likely missed other foreground; fallback protects correctness.",
+                )
+                min_fg_ratio = st.select_slider(
+                    "Min foreground area ratio before fallback",
+                    options=[0.005, 0.01, 0.02, 0.03, 0.05, 0.08, 0.1],
+                    value=0.02,
+                    help="If ROIs cover less than this fraction of the image, we assume proposer missed regions and run full SAHI once.",
+                )
+
+                st.write("**Debug (recommended when ROI looks wrong)**")
+                show_proposer = st.checkbox(
+                    "Show proposer detections overlay",
+                    value=True,
+                    help="Displays the proposer’s raw boxes on the full image so you can confirm it is finding the correct foreground (not only one corner).",
+                )
+                class_ids_text = st.text_input(
+                    "Target class IDs (optional)",
+                    value="",
+                    help="Comma-separated integers. Example: coco car=2. Leave empty to use all classes.",
+                )
+                show_rois = st.checkbox("Show proposed ROIs overlay", value=True)
 
         with right:
             if up is None:
@@ -574,8 +936,76 @@ def app():
                         t0 = time.perf_counter()
                         if backend.startswith("Ultralytics"):
                             out, det_count = _draw_ultralytics(
-                                rgb, model_path=model_path, imgsz=int(imgsz), conf=float(conf), device=device
+                                rgb,
+                                model_path=model_path,
+                                imgsz=int(imgsz),
+                                conf=float(conf),
+                                device=device,
                             )
+                            extra_meta: dict[str, Any] = {}
+                        elif backend.startswith("SAHI (ROI-gated"):
+                            target_class_ids = None
+                            if class_ids_text.strip():
+                                try:
+                                    target_class_ids = [int(x.strip()) for x in class_ids_text.split(",") if x.strip()]
+                                except Exception:
+                                    target_class_ids = None
+
+                            out, det_count, extra_meta = _draw_sahi_roi_gated(
+                                rgb,
+                                proposer_model_path=proposer_model,
+                                proposer_imgsz=int(proposer_imgsz),
+                                proposer_conf=float(proposer_conf),
+                                target_class_ids=target_class_ids,
+                                refiner_model_path=model_path,
+                                slice_size=int(slice_size),
+                                overlap=float(overlap),
+                                conf=float(conf),
+                                device=device,
+                                roi_margin=int(roi_margin),
+                                max_rois=int(max_rois),
+                                merge_iou=float(merge_iou),
+                                nms_iou=float(nms_iou),
+                            )
+
+                            if fallback_full_sahi:
+                                roi_count = int((extra_meta or {}).get("roi_count", 0))
+                                fg_ratio = float((extra_meta or {}).get("foreground_area_ratio", 0.0))
+                                should_fallback = False
+                                if fallback_condition.startswith("either"):
+                                    should_fallback = (roi_count == 0) or (int(det_count) == 0)
+                                elif "no ROIs" in fallback_condition:
+                                    should_fallback = (roi_count == 0)
+                                else:
+                                    should_fallback = (int(det_count) == 0)
+
+                                if fallback_low_fg and (fg_ratio > 0.0) and (fg_ratio < float(min_fg_ratio)):
+                                    should_fallback = True
+
+                                if should_fallback:
+                                    fb0 = time.perf_counter()
+                                    out_fb, det_fb = _draw_sahi(
+                                        rgb,
+                                        model_type="yolov8",
+                                        model_path=model_path,
+                                        slice_size=int(slice_size),
+                                        overlap=float(overlap),
+                                        conf=float(conf),
+                                        device=device,
+                                        target_class_ids=target_class_ids,
+                                    )
+                                    fb_ms = (time.perf_counter() - fb0) * 1000.0
+                                    out = out_fb
+                                    det_count = det_fb
+                                    extra_meta = dict(extra_meta or {})
+                                    extra_meta.update(
+                                        {
+                                            "fallback_used": True,
+                                            "fallback_backend": "SAHI (full scan)",
+                                            "fallback_ms": float(fb_ms),
+                                            "fallback_detections": int(det_fb),
+                                        }
+                                    )
                         else:
                             model_type = "yolov8"
                             out, det_count = _draw_sahi(
@@ -587,6 +1017,7 @@ def app():
                                 conf=float(conf),
                                 device=device,
                             )
+                            extra_meta = {}
                         dt = (time.perf_counter() - t0) * 1000
 
                     png = _np_rgb_to_png_bytes(out)
@@ -605,12 +1036,58 @@ def app():
                             "detections": int(det_count),
                             "latency_ms": float(dt),
                             "timestamp": _now_tag(),
+                            **(extra_meta or {}),
                         },
                     }
 
                     st.success(f"Done: {dt:.1f} ms | detections: {det_count}")
                     st.image(out, caption="Output", width="stretch")
                     st.download_button("Download PNG", data=png, file_name="prediction.png", mime="image/png")
+
+                    if extra_meta:
+                        fb_txt = ""
+                        if extra_meta.get("fallback_used"):
+                            fb_txt = (
+                                f" | fallback={extra_meta.get('fallback_backend')}"
+                                f" ({extra_meta.get('fallback_ms', 0.0):.1f} ms)"
+                            )
+                        st.caption(
+                            f"ROI-gated breakdown: proposer={extra_meta.get('proposer_ms', 0.0):.1f} ms | "
+                            f"refine={extra_meta.get('refine_ms', 0.0):.1f} ms | post={extra_meta.get('post_ms', 0.0):.1f} ms | "
+                            f"rois={extra_meta.get('roi_count', 0)} | fg_area={extra_meta.get('foreground_area_ratio', 0.0):.3f}{fb_txt}"
+                        )
+
+                        if extra_meta.get("fallback_used"):
+                            st.warning("ROI-gated output was empty; used fallback full-image SAHI for better recall.")
+
+                    if backend.startswith("SAHI (ROI-gated") and show_rois and extra_meta:
+                        try:
+                            rois = [tuple(map(int, r)) for r in (extra_meta.get("rois") or [])]
+                            st.image(
+                                _draw_roi_boxes(rgb, rois),
+                                caption=f"Proposed ROIs (count={len(rois)})",
+                                width="stretch",
+                            )
+                        except Exception:
+                            pass
+
+                    if backend.startswith("SAHI (ROI-gated") and show_proposer:
+                        try:
+                            proposer_vis, proposer_det = _draw_ultralytics(
+                                rgb,
+                                model_path=proposer_model,
+                                imgsz=int(proposer_imgsz),
+                                conf=float(proposer_conf),
+                                device=device,
+                                target_class_ids=target_class_ids,
+                            )
+                            st.image(
+                                proposer_vis,
+                                caption=f"Proposer overlay (detections={proposer_det})",
+                                width="stretch",
+                            )
+                        except Exception:
+                            pass
 
                 last = st.session_state.get("last_image_output")
                 if last is not None:
@@ -823,18 +1300,22 @@ def app():
         bsum = RESULTS_DIR / "benchmark_summary.md"
         rsum = RESULTS_DIR / "roi_sahi_summary.md"
         frep = RESULTS_DIR / "final_report.md"
+        pref = RESULTS_DIR / "professor_algorithm_report.md"
 
-        tabs = st.tabs(["Final report", "Benchmark summary", "ROI summary", "Latest JSON"])
+        tabs = st.tabs(["Professor algorithm report", "Final report", "Benchmark summary", "ROI summary", "Latest JSON"])
         with tabs[0]:
-            st.markdown(_read_text(frep) or "No final report found yet.")
+            st.markdown(_read_text(pref) or "No professor_algorithm_report.md yet.")
 
         with tabs[1]:
-            st.markdown(_read_text(bsum) or "No benchmark_summary.md yet.")
+            st.markdown(_read_text(frep) or "No final report found yet.")
 
         with tabs[2]:
-            st.markdown(_read_text(rsum) or "No roi_sahi_summary.md yet.")
+            st.markdown(_read_text(bsum) or "No benchmark_summary.md yet.")
 
         with tabs[3]:
+            st.markdown(_read_text(rsum) or "No roi_sahi_summary.md yet.")
+
+        with tabs[4]:
             latest = _latest_json("*_benchmark.json")
             if not latest:
                 st.info("No benchmark JSON found yet.")

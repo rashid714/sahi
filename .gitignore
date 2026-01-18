@@ -19,6 +19,10 @@ mobileclip_blt.ts
 outputs
 sliced_prediction_data
 
+# streamlit/ui artifacts
+results/ui_outputs/
+results/*.pdf
+
 # mmdetection
 mmdetection/build
 mmdetection/demo
