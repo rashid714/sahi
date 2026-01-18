@@ -284,8 +284,9 @@ def _draw_sahi_roi_gated(
 ) -> tuple[np.ndarray, int, dict[str, Any]]:
     """Professor-requested optimization: run SAHI only on foreground ROIs from pseudo labels."""
 
-    from sahi.predict import get_sliced_prediction
+    from sahi.predict import get_prediction, get_sliced_prediction
     from sahi.postprocess.combine import NMSPostprocess
+    from sahi.prediction import ObjectPrediction
     from sahi.utils.cv import visualize_object_predictions
 
     H, W = rgb.shape[:2]
@@ -358,25 +359,57 @@ def _draw_sahi_roi_gated(
         }
         return vis, 0, meta
 
+    def _shift_to_full(op, dx: int, dy: int):
+        # NOTE: SAHI ObjectPrediction / BoundingBox are immutable (frozen dataclasses).
+        # Do NOT try to set op.shift_amount; it won't affect op.bbox.shift_amount.
+        x1, y1, x2, y2 = op.bbox.to_xyxy()
+        nx1 = float(max(0.0, min(W, x1 + dx)))
+        ny1 = float(max(0.0, min(H, y1 + dy)))
+        nx2 = float(max(0.0, min(W, x2 + dx)))
+        ny2 = float(max(0.0, min(H, y2 + dy)))
+        if (nx2 - nx1) <= 0 or (ny2 - ny1) <= 0:
+            return None
+        return ObjectPrediction(
+            bbox=[nx1, ny1, nx2, ny2],
+            category_id=int(op.category.id),
+            category_name=str(op.category.name),
+            score=float(op.score.value),
+            segmentation=None,
+            shift_amount=[0, 0],
+            full_shape=None,
+        )
+
     for (x1, y1, x2, y2) in rois:
         crop_rgb = rgb[y1:y2, x1:x2]
-        # Ultralytics expects BGR when passing numpy arrays.
-        crop = crop_rgb[:, :, ::-1]
-        result = get_sliced_prediction(
-            crop,
-            detection_model,
-            slice_height=slice_size,
-            slice_width=slice_size,
-            overlap_height_ratio=overlap,
-            overlap_width_ratio=overlap,
-            postprocess_type="NMS",
-            perform_standard_pred=True,
-            verbose=False,
-        )
-        for op in result.object_prediction_list:
-            op.shift_amount = [int(x1), int(y1)]
-            op.full_shape = [int(H), int(W)]
-            all_preds.append(op.get_shifted_object_prediction())
+        # SAHI Ultralytics model expects RGB input and converts to BGR internally.
+        # If the crop is small, standard prediction is faster (and shifting is built-in).
+        if crop_rgb.shape[0] <= slice_size and crop_rgb.shape[1] <= slice_size:
+            pred = get_prediction(
+                crop_rgb,
+                detection_model,
+                shift_amount=[int(x1), int(y1)],
+                full_shape=[int(H), int(W)],
+                postprocess=None,
+                verbose=0,
+            )
+            for op in pred.object_prediction_list:
+                all_preds.append(op.get_shifted_object_prediction())
+        else:
+            result = get_sliced_prediction(
+                crop_rgb,
+                detection_model,
+                slice_height=slice_size,
+                slice_width=slice_size,
+                overlap_height_ratio=overlap,
+                overlap_width_ratio=overlap,
+                postprocess_type="NMS",
+                perform_standard_pred=True,
+                verbose=False,
+            )
+            for op in result.object_prediction_list:
+                shifted = _shift_to_full(op, int(x1), int(y1))
+                if shifted is not None:
+                    all_preds.append(shifted)
 
     t_refine_ms = (time.perf_counter() - t1) * 1000.0
 
@@ -504,11 +537,8 @@ def _draw_sahi(
         device=device or "cpu",
     )
 
-    # Ultralytics expects BGR when passing numpy arrays.
-    bgr = rgb[:, :, ::-1]
-
     result = get_sliced_prediction(
-        bgr,
+        rgb,
         detection_model,
         slice_height=slice_size,
         slice_width=slice_size,
